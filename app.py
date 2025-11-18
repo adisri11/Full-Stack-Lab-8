@@ -1,18 +1,20 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect, send_from_directory
 from flask_cors import CORS
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_bcrypt import Bcrypt
-from flask_admin import Admin
-from flask_admin.contrib.sqla import ModelView
 from config import Config
 from models import db, User, Course, enrollments
+from datetime import datetime
+import os
 
-app = Flask(__name__)
+# Setup Flask to serve React build
+app = Flask(__name__, static_folder='frontend/build', static_url_path='')
 app.config.from_object(Config)
 
 # Initialize extensions
 db.init_app(app)
-CORS(app, supports_credentials=True)
+# Remove CORS since everything is on same domain now
+# CORS(app, supports_credentials=True, origins=["http://localhost:3000"])
 bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
@@ -21,47 +23,12 @@ login_manager.login_view = 'login'
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-class SecureModelView(ModelView):
-    def is_accessible(self):
-        return current_user.is_authenticated and current_user.role == 'admin'
-    
-    def inaccessible_callback(self, name, **kwargs):
-        return jsonify({'error': 'Access denied'}), 403
+# -------- Admin Panel --------
+from admin_views import init_admin
+init_admin(app, db, bcrypt)
 
-class UserAdminView(SecureModelView):
-    column_list = ['id', 'username', 'full_name', 'email', 'role']
-    column_searchable_list = ['username', 'full_name', 'email']
-    column_filters = ['role']
-    form_excluded_columns = ['password_hash', 'enrolled_courses', 'taught_courses']
-    
-    def on_model_change(self, form, model, is_created):
-        if is_created and hasattr(form, 'password'):
-            # Hash password on creation
-            model.password_hash = bcrypt.generate_password_hash(
-                form.password.data
-            ).decode('utf-8')
-
-class CourseAdminView(SecureModelView):
-    column_list = ['id', 'course_code', 'course_name', 'teacher', 'time_schedule', 
-                   'capacity', 'current_enrollment']
-    column_searchable_list = ['course_code', 'course_name']
-    column_filters = ['teacher']
-    
-    def _current_enrollment_formatter(view, context, model, name):
-        return model.current_enrollment()
-    
-    column_formatters = {
-        'current_enrollment': _current_enrollment_formatter
-    }
-
-# Initialize Flask-Admin
-admin = Admin(app, name='ACME Admin')
-admin.add_view(UserAdminView(User, db.session))
-admin.add_view(CourseAdminView(Course, db.session))
-
-#sample data used for testing database, we can take this out later
+# -------- Create sample data (only once) --------
 def create_sample_data():
-    """Create sample users and courses for testing"""
     admin = User(
         username='admin',
         password_hash=bcrypt.generate_password_hash('admin123').decode('utf-8'),
@@ -77,7 +44,7 @@ def create_sample_data():
         email='ahepworth@acme.edu',
         role='teacher'
     )
-    
+
     teacher2 = User(
         username='swalker',
         password_hash=bcrypt.generate_password_hash('password').decode('utf-8'),
@@ -85,7 +52,7 @@ def create_sample_data():
         email='swalker@acme.edu',
         role='teacher'
     )
-    
+
     student1 = User(
         username='cnorris',
         password_hash=bcrypt.generate_password_hash('password').decode('utf-8'),
@@ -93,7 +60,7 @@ def create_sample_data():
         email='cnorris@acme.edu',
         role='student'
     )
-    
+
     student2 = User(
         username='msmith',
         password_hash=bcrypt.generate_password_hash('password').decode('utf-8'),
@@ -101,10 +68,10 @@ def create_sample_data():
         email='msmith@acme.edu',
         role='student'
     )
-    
+
     db.session.add_all([admin, teacher1, teacher2, student1, student2])
     db.session.commit()
-    
+
     course1 = Course(
         course_code='CS 106',
         course_name='Introduction to Computer Science',
@@ -112,7 +79,7 @@ def create_sample_data():
         time_schedule='MWF 2:00-2:50 PM',
         capacity=10
     )
-    
+
     course2 = Course(
         course_code='CS 162',
         course_name='Data Structures',
@@ -120,7 +87,7 @@ def create_sample_data():
         time_schedule='TR 3:00-3:50 PM',
         capacity=4
     )
-    
+
     course3 = Course(
         course_code='Physics 121',
         course_name='General Physics',
@@ -128,30 +95,55 @@ def create_sample_data():
         time_schedule='TR 11:00-11:50 AM',
         capacity=10
     )
-    
+
     db.session.add_all([course1, course2, course3])
     db.session.commit()
-    
+
     student1.enrolled_courses.append(course1)
     student1.enrolled_courses.append(course3)
     db.session.commit()
 
-# Create database tables
+
 with app.app_context():
     db.create_all()
-    # Add sample data if database is empty
     if User.query.count() == 0:
         create_sample_data()
 
+# -------------------------------------------------------
+#                    AUTH ROUTES
+# -------------------------------------------------------
 
-# API ENDPOINTS
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Traditional Flask login page."""
+    from login_page import render_login_page
+
+    if request.method == "GET":
+        return render_login_page()
+
+    username = request.form.get("username")
+    password = request.form.get("password")
+    user = User.query.filter_by(username=username).first()
+
+    if user and bcrypt.check_password_hash(user.password_hash, password):
+        login_user(user)
+
+        if user.role == "admin":
+            return redirect("/admin")
+        elif user.role == "teacher":
+            return redirect("/teacher")
+        elif user.role == "student":
+            return redirect("/student")
+
+    return render_login_page(error="Invalid username or password")
 
 @app.route('/api/login', methods=['POST'])
-def login():
+def api_login():
+    """Login used by React frontend."""
     data = request.json
-    user = User.query.filter_by(username=data.get('username')).first()
-    
-    if user and bcrypt.check_password_hash(user.password_hash, data.get('password')):
+    user = User.query.filter_by(username=data.get("username")).first()
+
+    if user and bcrypt.check_password_hash(user.password_hash, data.get("password")):
         login_user(user)
         return jsonify({
             'success': True,
@@ -164,15 +156,26 @@ def login():
         })
     return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
 
+
+# -------------------------------------------------------
+#                  STUDENT + TEACHER API
+# -------------------------------------------------------
+
 @app.route('/api/logout', methods=['POST'])
 @login_required
-def logout():
+def api_logout():
     logout_user()
     return jsonify({'success': True})
 
-@app.route('/api/current-user', methods=['GET'])
+@app.route('/logout')
 @login_required
-def get_current_user():
+def logout_redirect():
+    logout_user()
+    return redirect('/login')
+
+@app.route('/api/current-user')
+@login_required
+def api_current_user():
     return jsonify({
         'id': current_user.id,
         'username': current_user.username,
@@ -180,69 +183,81 @@ def get_current_user():
         'role': current_user.role
     })
 
-@app.route('/api/courses', methods=['GET'])
+@app.route('/api/courses')
 @login_required
-def get_courses():
-    """Get all courses with enrollment info"""
+def api_courses():
+    """Return all courses with enrollment info."""
     courses = Course.query.all()
-    return jsonify([{
-        'id': course.id,
-        'course_code': course.course_code,
-        'course_name': course.course_name,
-        'teacher_name': course.teacher.full_name,
-        'time_schedule': course.time_schedule,
-        'enrolled': course.current_enrollment(),
-        'capacity': course.capacity,
-        'is_full': course.is_full()
-    } for course in courses])
+    return jsonify([
+        {
+            'id': c.id,
+            'course_code': c.course_code,
+            'course_name': c.course_name,
+            'teacher_name': c.teacher.full_name,
+            'time_schedule': c.time_schedule,
+            'enrolled': c.current_enrollment(),
+            'capacity': c.capacity,
+            'is_full': c.is_full()
+        }
+        for c in courses
+    ])
 
-@app.route('/api/my-courses', methods=['GET'])
+@app.route('/api/my-courses')
 @login_required
-def get_my_courses():
-    """Get courses for current user (student or teacher)"""
-    if current_user.role == 'student':
-        courses = current_user.enrolled_courses
-        return jsonify([{
-            'id': course.id,
-            'course_code': course.course_code,
-            'course_name': course.course_name,
-            'teacher_name': course.teacher.full_name,
-            'time_schedule': course.time_schedule,
-            'enrolled': course.current_enrollment(),
-            'capacity': course.capacity
-        } for course in courses])
-    
-    elif current_user.role == 'teacher':
-        courses = current_user.taught_courses
-        return jsonify([{
-            'id': course.id,
-            'course_code': course.course_code,
-            'course_name': course.course_name,
-            'time_schedule': course.time_schedule,
-            'enrolled': course.current_enrollment(),
-            'capacity': course.capacity
-        } for course in courses])
-    
+def api_my_courses():
+    """Return student's courses OR teacher's courses."""
+    if current_user.role == "student":
+        result = db.session.query(Course, enrollments.c.grade) \
+            .join(enrollments, Course.id == enrollments.c.course_id) \
+            .filter(enrollments.c.student_id == current_user.id) \
+            .all()
+
+        return jsonify([
+            {
+                'id': course.id,
+                'course_code': course.course_code,
+                'course_name': course.course_name,
+                'teacher_name': course.teacher.full_name,
+                'time_schedule': course.time_schedule,
+                'enrolled': course.current_enrollment(),
+                'capacity': course.capacity,
+                'grade': grade
+            }
+            for course, grade in result
+        ])
+
+    if current_user.role == "teacher":
+        return jsonify([
+            {
+                'id': c.id,
+                'course_code': c.course_code,
+                'course_name': c.course_name,
+                'time_schedule': c.time_schedule,
+                'enrolled': c.current_enrollment(),
+                'capacity': c.capacity
+            }
+            for c in current_user.taught_courses
+        ])
+
     return jsonify([])
 
 @app.route('/api/enroll/<int:course_id>', methods=['POST'])
 @login_required
-def enroll_course(course_id):
-    """Enroll student in a course"""
-    if current_user.role != 'student':
+def api_enroll(course_id):
+    if current_user.role != "student":
         return jsonify({'success': False, 'message': 'Only students can enroll'}), 403
-    
+
     course = Course.query.get_or_404(course_id)
-    
+
     if course.is_full():
         return jsonify({'success': False, 'message': 'Course is full'}), 400
-    
+
     if course in current_user.enrolled_courses:
         return jsonify({'success': False, 'message': 'Already enrolled'}), 400
-    
+
     current_user.enrolled_courses.append(course)
     db.session.commit()
-    
+
     return jsonify({'success': True, 'message': 'Enrolled successfully'})
 
 @app.route('/api/course/<int:course_id>/students', methods=['GET'])
@@ -291,6 +306,27 @@ def update_grade(course_id, student_id):
     db.session.commit()
     
     return jsonify({'success': True, 'message': 'Grade updated'})
+
+
+# -------------------------------------------------------
+#                  SERVE REACT APP
+# -------------------------------------------------------
+
+@app.route('/teacher')
+@app.route('/teacher/<path:subpath>')
+@app.route('/student')
+@app.route('/student/<path:subpath>')
+def serve_react_pages(subpath=''):
+    """Serve React app for teacher/student pages"""
+    return send_from_directory(app.static_folder, 'index.html')
+
+@app.route('/')
+def index():
+    return redirect('/login')
+
+# -------------------------------------------------------
+#                    START SERVER
+# -------------------------------------------------------
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
